@@ -119,27 +119,27 @@ internal/
                    ┌─────────────────────────────────────────────────────┐
                    │                   Engine (per cycle)                │
                    │                                                     │
-  OpenSearch API   │  ┌──────────────┐     ClusterSnapshot              │
-  (real or sim) ──►│  │  Monitoring  ├─────────────────────►            │
+  OpenSearch API   │  ┌──────────────┐     ClusterSnapshot               │
+  (real or sim) ──►│  │  Monitoring  ├─────────────────────►             │
                    │  │    Agent     │                                   │
-                   │  └──────────────┘  ┌───────────────────┐           │
-                   │                    │  Circuit Breaker   │           │
-                   │  ClusterSnapshot──►│  • Health check    │           │
-                   │                    │  • Latency check   │           │
-                   │                    │  • Reloc. check    │           │
-                   │                    └────────┬──────────┘           │
+                   │  └──────────────┘  ┌───────────────────┐            │
+                   │                    │  Circuit Breaker  │            │ 
+                   │  ClusterSnapshot──►│  • Health check   │            │
+                   │                    │  • Latency check  │            │
+                   │                    │  • Reloc. check   │            │
+                   │                    └────────┬──────────┘            │
                    │                             │ CLOSED                │
-                   │                    ┌────────▼──────────┐           │
-                   │                    │  Target State Gen. │           │
-                   │                    │  • Hot node score  │           │
-                   │                    │  • Large-first sort│           │
-                   │                    │  • Placement guards│           │
-                   │                    └────────┬──────────┘           │
+                   │                    ┌────────▼──────────┐            │
+                   │                    │ Target State Gen. │            │
+                   │                    │ • Hot node score  │            │
+                   │                    │ • Large-first sort│            │
+                   │                    │ • Placement guards│            │
+                   │                    └────────┬──────────┘            │
                    │                             │ ShardMoves            │
-                   │                    ┌────────▼──────────┐           │
-                   │                    │  Executor          │──►  API  │
-                   │                    │  _cluster/reroute  │  (or log)│
-                   │                    └───────────────────┘           │
+                   │                    ┌────────▼──────────┐            │
+                   │                    │  Executor         │──►  API    │
+                   │                    │  _cluster/reroute │  (or log)  │
+                   │                    └───────────────────┘            │
                    └─────────────────────────────────────────────────────┘
 ```
 
