@@ -45,10 +45,10 @@ import (
 func main() {
 	// ── CLI flags ────────────────────────────────────────────────────────────
 	configPath := flag.String("config", "config.json", "Path to JSON configuration file")
-	simulate   := flag.Bool("simulate", false, "Run against a virtual 10-node cluster")
-	dryRun     := flag.Bool("dry-run", false, "Plan moves but do not execute (overrides config)")
-	once       := flag.Bool("once", false, "Run a single cycle then exit")
-	cycles     := flag.Int("cycles", 3, "Number of simulation cycles (--simulate only)")
+	simulate := flag.Bool("simulate", false, "Run against a virtual 10-node cluster")
+	dryRun := flag.Bool("dry-run", false, "Plan moves but do not execute (overrides config)")
+	once := flag.Bool("once", false, "Run a single cycle then exit")
+	cycles := flag.Int("cycles", 3, "Number of simulation cycles (--simulate only)")
 	flag.Parse()
 
 	// ── Logger ───────────────────────────────────────────────────────────────
@@ -107,10 +107,10 @@ func main() {
 	}
 
 	// ── Component wiring ─────────────────────────────────────────────────────
-	mon       := agent.New(client, cfg.Agent, logger)
-	breaker   := circuitbreaker.New(cfg.CircuitBreaker, logger)
+	mon := agent.New(client, cfg.Agent, logger)
+	breaker := circuitbreaker.New(cfg.CircuitBreaker, logger)
 	generator := rebalancer.NewTargetStateGenerator(cfg.Agent, cfg.Rebalancer)
-	engine    := rebalancer.NewEngine(client, mon, breaker, generator, *cfg, logger)
+	engine := rebalancer.NewEngine(client, mon, breaker, generator, *cfg, logger)
 
 	// ── Context (graceful shutdown on SIGINT/SIGTERM) ─────────────────────────
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

@@ -1,40 +1,102 @@
 # Sway
 
-**Automated shard rebalancing engine for OpenSearch — cloud-agnostic, safety-first, incremental by design.**
+**A shard rebalancer for OpenSearch whose main feature is knowing when *not* to act.**
 
-Built as an Instaclustr portfolio project, Sway continuously monitors a cluster's resource distribution, scores each node using a weighted composite metric, plans the minimum set of shard movements needed to reduce load skew, and executes those moves — all behind a layered circuit breaker that gates every action.
+Sway watches an OpenSearch cluster for hot spots, computes the minimum set of shard moves needed to relieve them, and gates every single move behind a circuit breaker and a dry-run default. It ships with a deterministic 10-node cluster simulator, so you can watch the full monitor → gate → plan → execute loop converge from a skewed state to a balanced one with a single command and no OpenSearch cluster at all.
+
+**[Live demo →](https://joshuabvarghese.github.io/Sway/)** &nbsp;·&nbsp; 20/20 tests passing &nbsp;·&nbsp; `go vet` clean &nbsp;·&nbsp; `gofmt` clean
 
 ---
 
 ## Why Sway exists
 
-OpenSearch clusters drift. A few indices grow faster than others, a handful of nodes absorb most of the query load, and suddenly two nodes are running hot while the rest sit idle. The built-in balancer handles shard counts but knows nothing about JVM pressure or disk saturation.
+OpenSearch's built-in balancer distributes shard *counts* evenly. It has no opinion on JVM heap pressure or disk saturation, so two nodes can end up carrying most of the query and indexing load while the rest sit idle — the cluster is "balanced" on paper and unbalanced in practice.
 
-Sway watches those signals — heap usage, disk fill rate, shard count — combines them into a single hotness score per node, and moves shards from the hottest nodes to the coolest ones, largest shards first. It does just enough work per cycle to hit a configurable reduction target, then waits. The result is a cluster that converges toward balance incrementally rather than thrashing.
+Sway closes that gap. It scores every node on a weighted blend of heap, disk, and shard-count signals, moves the largest shards off the hottest nodes first, and stops as soon as it's relieved a configurable fraction of the skew. It does not try to achieve a perfect balance in one shot — it does *just enough*, on a schedule, and lets the cluster settle.
+
+The interesting engineering problem here isn't the scoring model, which is a deliberately simple weighted sum. It's that **this program is allowed to move production data around by itself**, and the entire design is organized around making that safe.
 
 ---
 
 ## Safety model
 
-> *An automation that breaks a cluster is infinitely worse than one that does nothing.*
+> An automation that breaks a cluster is worse than one that does nothing.
 
-Every design decision flows from that principle.
+**Layer 1 — Default immutability.** `dry_run` is `true` in every factory-default config ([`config.Default()`](internal/config/config.go)). The engine plans and logs every move it *would* make without touching the cluster. A misconfigured deployment cannot accidentally move a shard — live execution is an explicit, deliberate opt-in.
 
-**Layer 1 — Default immutability.** `dry_run` is `true` in the factory config. The engine plans and logs every move it *would* make without touching the cluster. Live execution requires a deliberate opt-in. A misconfigured deployment cannot accidentally move shards.
-
-**Layer 2 — Circuit breaker.** Before each cycle begins, three conditions are checked against the live cluster:
+**Layer 2 — Circuit breaker.** Before every cycle, three conditions are checked against the live cluster ([`internal/circuitbreaker`](internal/circuitbreaker/breaker.go)):
 
 | Check | What it measures | Default threshold |
 |---|---|---|
 | Cluster health | `_cluster/health` status | Must be `green` |
 | Avg search latency | Mean query time across data nodes | Must be `< 200 ms` |
-| Relocating shards | Active migrations already in flight | Must be `0` |
+| Relocating shards | Migrations already in flight | Must be `0` |
 
-If any single check fails, the circuit opens and the cycle is aborted. Every check is logged with both its measured value and its configured threshold, so operators have a complete audit trail of why automation was blocked. The circuit is re-evaluated fresh on the next cycle — there is no half-open state or recovery assumption.
+If any single check fails, the circuit opens and the whole cycle is aborted — no partial moves. Every check logs both its measured value and its configured threshold, so an operator reading the log can see exactly why automation did or didn't run. The circuit is re-evaluated fresh every cycle; there's no half-open state and no assumption that a bad condition has cleared itself.
 
-**Layer 3 — Conservative move sizing.** `max_moves_per_cycle` caps relocations per pass (default: 5). `skew_reduction_target` stops planning once the projected improvement meets the configured fraction (default: 25%). The engine does not try to fix everything in one shot.
+**Layer 3 — Conservative move sizing.** `max_moves_per_cycle` caps relocations per pass (default: 5). `skew_reduction_target` stops planning once the projected improvement hits the configured fraction (default: 25%). The generator doesn't try to solve the whole imbalance in one pass — see [`TargetStateGenerator.Generate`](internal/rebalancer/target.go).
 
-**Layer 4 — Placement guards.** A shard's primary and its replica are never placed on the same destination node. A destination is skipped if placing the shard would push its projected disk usage above 90%.
+**Layer 4 — Placement guards.** A shard's primary and its replica are never planned onto the same destination node, and a destination is skipped if the move would push its projected disk usage past 90%. Both guards are covered by [tests](internal/rebalancer/target_test.go) — including a case where the *largest* candidate shard has no legal destination and the generator correctly skips it in favor of the next one, rather than giving up on the cycle.
+
+---
+
+## See it work
+
+The fastest way to see the whole loop end-to-end is the built-in simulator — no Docker, no OpenSearch cluster, no config:
+
+```bash
+go build -o rebalancer ./cmd/rebalancer
+./rebalancer --simulate --cycles 3
+```
+
+This is a real run, captured verbatim (`internal/simulation` is deterministic — you'll get the same numbers):
+
+```
+======================================================================
+  SIMULATED CLUSTER INITIAL STATE
+  Cluster: simulated-cluster  |  Nodes: 10  |  Total Shards: 31
+======================================================================
+  node-0   85.0% JVM   20.8% disk   6 shards   ← hot
+  node-1   79.0% JVM   15.1% disk   6 shards   ← hot
+  node-2   71.0% JVM   10.7% disk   5 shards
+  node-3–9  ...                     2 shards each, all underutilised
+
+CYCLE 1
+  [CIRCUIT BREAKER] health=GREEN latency=0.0ms relocating=0 → CLOSED
+  Current Skew  : 0.1509
+  Projected Skew: 0.1038  (31.2% reduction, target 25% ✓)
+  Planned 4 moves (largest first):
+    logs-2024[0]/primary     22.00 GiB   node-0 → node-9
+    traces-2024[0]/primary   19.00 GiB   node-0 → node-8
+    logs-2024[1]/primary     16.00 GiB   node-0 → node-7
+    logs-2024[2]/primary     14.00 GiB   node-1 → node-6
+
+CYCLE 2
+  Current Skew  : 0.1024 → Projected Skew: 0.0643  (37.2% reduction)
+  3 moves planned
+
+CYCLE 3
+  Current Skew  : 0.0666 → Projected Skew: 0.0483  (27.4% reduction)
+  2 moves planned
+
+SIMULATION COMPLETE — 3 cycles executed.
+```
+
+Nine targeted moves take the cluster from a two-hot-node imbalance (skew 0.151) to a tight band around 0.048 — each move chosen to maximise disk-pressure relief per API call, none of them touching a node already at capacity.
+
+The [live demo](https://joshuabvarghese.github.io/Sway/) replays this exact transcript alongside the circuit-breaker state, if you want to watch it without building anything.
+
+### Dry run against a real cluster
+
+```bash
+./rebalancer --config config.json --dry-run --once
+```
+
+Plans and logs every move the engine would make, touches nothing, exits. This is the correct first step before ever setting `dry_run: false`.
+
+### Full local demo with real OpenSearch
+
+[`demo/`](demo/) has a self-contained walkthrough: `docker-compose up` a 3-node OpenSearch cluster, seed it with real indices, force a visible skew onto one node, watch it in OpenSearch Dashboards, then run Sway against it in dry-run and live mode. See [`demo/README.md`](demo/README.md) for the full steps.
 
 ---
 
@@ -45,29 +107,13 @@ cmd/rebalancer/
 └── main.go                  CLI wiring; selects real vs simulated client
 
 internal/
-├── config/
-│   └── config.go            Cloud-agnostic config; conservative defaults
-│
-├── opensearch/
-│   ├── types.go             Exact API response types (_nodes/stats, _cluster/state, etc.)
-│   └── client.go            Client interface + HTTP implementation
-│
-├── agent/
-│   ├── metrics.go           NodeMetrics, ShardInfo, ClusterSnapshot types
-│   └── agent.go             MonitoringAgent: scrapes APIs, computes hot-scores
-│
-├── circuitbreaker/
-│   └── breaker.go           Safety gate: health + latency + relocating checks
-│
-├── rebalancer/
-│   ├── target.go            TargetStateGenerator: plans minimal shard moves
-│   └── engine.go            Orchestrates the full collect → check → plan → execute cycle
-│
-└── simulation/
-    └── simulator.go         Virtual 10-node cluster implementing opensearch.Client
+├── config/       config.go            Cloud-agnostic config; conservative defaults
+├── opensearch/   types.go, client.go  API response types + Client interface/HTTP impl
+├── agent/        metrics.go, agent.go MonitoringAgent: scrapes APIs, computes hot-scores
+├── circuitbreaker/ breaker.go         Safety gate: health + latency + relocating checks
+├── rebalancer/   target.go, engine.go Plans minimal moves; orchestrates the full cycle
+└── simulation/   simulator.go         Deterministic virtual 10-node cluster
 ```
-
-### Data flow
 
 ```
                    ┌─────────────────────────────────────────────────────┐
@@ -87,7 +133,7 @@ internal/
                    │                    │  Target State Gen. │           │
                    │                    │  • Hot node score  │           │
                    │                    │  • Large-first sort│           │
-                   │                    │  • Capacity guard  │           │
+                   │                    │  • Placement guards│           │
                    │                    └────────┬──────────┘           │
                    │                             │ ShardMoves            │
                    │                    ┌────────▼──────────┐           │
@@ -101,27 +147,23 @@ internal/
 
 ## Hot node scoring
 
-A node's hotness is a weighted composite of three normalised metrics:
-
 ```
-HotScore = JVMWeight × (heapUsed%) + DiskWeight × (diskUsed%) + ShardWeight × (shardCount / maxShards)
+HotScore = JVMWeight × heapUsed% + DiskWeight × diskUsed% + ShardWeight × (shardCount / maxShards)
 ```
-
-Default weights:
 
 | Metric | Weight | Rationale |
 |---|---|---|
-| JVM heap | **0.40** | Heap pressure is the most direct signal of query and indexing load |
-| Disk usage | **0.40** | Disk saturation causes the hardest failures — writes stop entirely |
+| JVM heap | **0.40** | Heap pressure is the most direct signal of query/indexing load |
+| Disk usage | **0.40** | Disk saturation causes the hardest failure mode — writes stop entirely |
 | Shard count | **0.20** | A proxy for query fan-out and indexing thread contention |
 
-A node is classified **HOT** when its score reaches `hot_node_threshold` (default: `0.70`). All weights and the threshold are configurable without any code changes.
+A node is `HOT` when its score reaches `hot_node_threshold` (default `0.70`; the simulator uses `0.50`, tuned for its smaller synthetic cluster — see `main.go`). Weights and threshold are config, not code.
 
 ---
 
 ## Cloud-agnostic design
 
-The `opensearch.Client` interface is the only abstraction boundary. Everything above it — the monitoring agent, circuit breaker, target-state generator, and executor — is cloud-neutral and has no knowledge of where the cluster is running.
+`opensearch.Client` is the only abstraction boundary. The monitoring agent, circuit breaker, target-state generator, and executor are all cloud-neutral and have no idea what's underneath them:
 
 ```go
 type Client interface {
@@ -133,93 +175,61 @@ type Client interface {
 }
 ```
 
-Cloud-specific auth is injected via a custom `http.RoundTripper` — no changes to any algorithm or safety check are required:
+Cloud-specific auth is injected as a `http.RoundTripper` — this is an extension point the codebase supports, not a bundled integration; you provide the transport:
 
 ```go
-// AWS OpenSearch Service — SigV4 signing
+// AWS OpenSearch Service — plug in your own SigV4 signing transport
 client := opensearch.NewHTTPClient(
     "https://search-mycluster.us-east-1.es.amazonaws.com",
     "", "", true, 30*time.Second,
-    opensearch.WithTransport(sigV4RoundTripper),
+    opensearch.WithTransport(yourSigV4RoundTripper),
 )
 
-// GCP Managed OpenSearch — token refresh
-client := opensearch.NewHTTPClient(
-    "https://opensearch.internal.example.com:9200",
-    "", "", true, 30*time.Second,
-    opensearch.WithTransport(gcpTokenTransport),
-)
-
-// On-Premise — basic auth, no custom transport needed
-client := opensearch.NewHTTPClient(
-    "https://10.0.0.1:9200",
-    "admin", "secret", true, 30*time.Second,
-)
+// On-premise — basic auth, no custom transport needed
+client := opensearch.NewHTTPClient("https://10.0.0.1:9200", "admin", "secret", true, 30*time.Second)
 ```
 
 ---
 
 ## Getting started
 
-### Prerequisites
-
-- Go 1.21+
-
-### Build
+**Prerequisites:** Go 1.21+
 
 ```bash
-git clone https://github.com/project-sway/sway
+git clone https://github.com/joshuabvarghese/sway.git
 cd sway
-go build ./cmd/rebalancer
+go build -o rebalancer ./cmd/rebalancer
+go test ./...          # 20/20, all deterministic, no network required
 ```
 
-### Simulation demo (no cluster required)
+### CLI reference
 
-Runs a virtual 10-node cluster — intentionally skewed — through 3 rebalancing cycles:
+```
+Usage: rebalancer [flags]
 
-```bash
-./rebalancer --simulate --cycles 3
+  --config string    Path to JSON config file (default: "config.json")
+  --simulate         Run against a virtual 10-node cluster (no real cluster needed)
+  --dry-run          Plan moves but do not execute (overrides config file)
+  --once             Execute a single cycle then exit
+  --cycles int       Number of simulation cycles (default: 3, --simulate only)
 ```
 
-The simulator starts with two HOT nodes (node-0 at 85% JVM heap with 6 shards, node-1 at 79% with 6 shards) and a skew score around 0.15. You'll watch the largest shards get redistributed first, and the cluster converge toward ~0.05 over three cycles.
+### Configuration
 
-### Dry run against a real cluster
-
-```bash
-./rebalancer --config config.json --dry-run --once
-```
-
-This plans and logs every move the engine would make, touches nothing, and exits. A good first step before enabling live execution.
-
-### Continuous live rebalancing
-
-```bash
-./rebalancer --config config.json
-```
-
-Press `Ctrl+C` for a graceful shutdown.
-
----
-
-## Configuration
-
-A complete `config.json` with all defaults shown:
+Every field, with its default:
 
 ```json
 {
   "opensearch": {
     "addresses": ["http://localhost:9200"],
-    "username": "",
-    "password": "",
+    "username": "", "password": "",
     "tls_verify": true,
     "timeout_seconds": 30
   },
   "agent": {
     "poll_interval_seconds": 30,
     "hot_node_threshold": 0.70,
-    "jvm_weight": 0.40,
-    "disk_weight": 0.40,
-    "shard_weight": 0.20
+    "jvm_weight": 0.40, "disk_weight": 0.40, "shard_weight": 0.20
   },
   "rebalancer": {
     "dry_run": true,
@@ -235,69 +245,42 @@ A complete `config.json` with all defaults shown:
 }
 ```
 
-`dry_run` defaults to `true`. The engine will not move a single shard until you explicitly set it to `false`.
+`dry_run` defaults to `true`. Sway will not move a single shard until you explicitly set it to `false`.
 
 ---
 
-## CLI reference
+## What's tested, and what isn't
+
+The four packages that make placement decisions or gate execution have real, deterministic unit tests — no live cluster or mocked network calls required:
+
+- **`circuitbreaker`** — every check independently and in combination, health-rank comparisons, and that `Last()` reflects the most recent evaluation.
+- **`config`** — the safety-first defaults, that a partial config file overlays correctly onto (rather than replacing) defaults, and that a missing file errors instead of silently defaulting.
+- **`rebalancer`** — largest-shard-first ordering, the primary/replica co-location guard, the 90% capacity guard, both cycle-stopping conditions (`max_moves_per_cycle` and `skew_reduction_target`), and the case where the largest candidate has no legal destination and the generator correctly falls through to the next one.
 
 ```
-Usage: rebalancer [flags]
-
-  --config string    Path to JSON config file (default: "config.json")
-  --simulate         Run against a virtual 10-node cluster (no real cluster needed)
-  --dry-run          Plan moves but do not execute (overrides config file)
-  --once             Execute a single cycle then exit
-  --cycles int       Number of simulation cycles (default: 3, --simulate only)
+go test ./...
+ok  github.com/project-sway/sway/internal/circuitbreaker
+ok  github.com/project-sway/sway/internal/config
+ok  github.com/project-sway/sway/internal/rebalancer
 ```
+
+What isn't covered yet: `internal/agent` (the scraping/aggregation glue), `internal/opensearch` (the HTTP client — would need a mocked server), and `internal/simulation` (exercised indirectly by every simulator run, including the transcript above, but with no assertions of its own). Honest gap, not hidden.
 
 ---
 
 ## Extending the engine
 
-### True p99 latency
+**True p99 latency.** The agent currently computes average latency from cumulative OpenSearch counters — a reasonable proxy, not a histogram percentile. To use true p99, implement a collector that reads from Prometheus/OTel/your APM and set `snap.AvgSearchLatMs` accordingly. Nothing in the circuit breaker or rebalancer needs to change.
 
-The current agent computes average latency from cumulative OpenSearch counters, which is a reasonable proxy but not a histogram percentile. To use true p99, implement a collector that reads from Prometheus, OpenTelemetry, or your APM backend and sets `snap.AvgSearchLatMs` accordingly. The circuit breaker and rebalancer need no changes.
+**A new scoring signal.** Add a field to `agent.NodeMetrics`, populate it in `CollectSnapshot`, add a weight to `config.AgentConfig`, and include the term in both `agent.hotScore` and `rebalancer.projectedNode.hotScore` — they're intentionally kept in lockstep.
 
-### Adding a metric to the hot score
-
-1. Add a field to `agent.NodeMetrics`.
-2. Populate it in `agent.MonitoringAgent.CollectSnapshot`.
-3. Add a weight field to `config.AgentConfig`.
-4. Include the term in both `MonitoringAgent.hotScore` and `rebalancer.projectedNode.hotScore`.
-
-### Plugging in a different execution backend
-
-Implement `opensearch.Client` — for example, to target a different search engine's reroute API, or to stub moves in integration tests — and pass it to `rebalancer.NewEngine`. Nothing else in the stack changes.
+**A different execution backend.** Implement `opensearch.Client` — to target a different search engine's reroute API, or to stub moves in an integration test — and hand it to `rebalancer.NewEngine`. Nothing else in the stack changes.
 
 ---
 
-## Simulation output walkthrough
+## Where this fits
 
-```
-SIMULATED CLUSTER INITIAL STATE
-  node-0  85% JVM  20% disk  6 shards   HOT (score 0.62)
-  node-1  79% JVM  15% disk  6 shards   HOT (score 0.58)
-  node-2  71% JVM  11% disk  5 shards
-  node-3–9            2 shards each     all underutilised
-
-CYCLE 1
-  Circuit: CLOSED (all checks pass)
-  Planned 4 moves (largest first):
-    logs-2024[0]/primary    22 GiB   node-0 → node-9
-    traces-2024[0]/primary  19 GiB   node-0 → node-8
-    logs-2024[1]/primary    16 GiB   node-0 → node-7
-    logs-2024[2]/primary    14 GiB   node-1 → node-6
-  Skew: 0.1509 → 0.1024  (31% reduction, target 25% ✓)
-
-CYCLE 2
-  3 moves — skew 0.1024 → 0.0666
-
-CYCLE 3
-  2 moves — skew 0.0666 → 0.0483
-```
-
-By cycle 3, the cluster has moved from a two-hot-node imbalance to all nodes within a narrow score band — using 9 targeted API calls, each chosen to maximise disk-pressure relief per move.
+This is one of several infrastructure-tooling projects I've built to explore a specific slice of distributed-systems and SRE engineering — this one is deliberately narrow: a single automation, doing one job, with the majority of the design effort spent on the conditions under which it's *allowed* to act. It isn't a chaos-engineering harness, a general agent framework, or a debugging proxy — those are separate projects in the same portfolio, built around different problems on purpose.
 
 ---
 

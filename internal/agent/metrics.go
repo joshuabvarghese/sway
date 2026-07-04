@@ -5,10 +5,10 @@ import "time"
 
 // NodeMetrics holds the computed, normalised metrics for one cluster node.
 type NodeMetrics struct {
-	NodeID   string
-	NodeName string
-	Host     string
-	Roles    []string
+	NodeID     string
+	NodeName   string
+	Host       string
+	Roles      []string
 	IsDataNode bool
 
 	// Raw resource readings.

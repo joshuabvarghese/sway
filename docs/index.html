@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sway — safety-first shard rebalancer for OpenSearch</title>
+<meta name="description" content="A cloud-agnostic shard rebalancer for OpenSearch that gates every move behind a circuit breaker and a dry-run default.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#10141a;
+    --panel:#171d26;
+    --panel-2:#1c232e;
+    --line:#2a323e;
+    --text:#e9edf2;
+    --muted:#8b95a5;
+    --muted-2:#5f6878;
+    --safe:#3ecf8e;
+    --safe-dim:#245c46;
+    --gate:#e8a33d;
+    --blocked:#e0605a;
+    --data:#6fa3d8;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: 'IBM Plex Sans', system-ui, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--data);}
+  a:focus-visible, button:focus-visible{outline:2px solid var(--safe); outline-offset:3px;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px;}
+
+  /* ── top bar ─────────────────────────────────────────── */
+  .topbar{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:20px 28px;border-bottom:1px solid var(--line);
+    font-family:var(--mono);font-size:13px;color:var(--muted);
+  }
+  .topbar .brand{color:var(--text);font-weight:600;letter-spacing:0.02em;}
+  .topbar nav a{color:var(--muted);text-decoration:none;margin-left:22px;}
+  .topbar nav a:hover{color:var(--text);}
+
+  /* ── hero ────────────────────────────────────────────── */
+  .hero{padding:64px 0 40px;}
+  .eyebrow{
+    font-family:var(--mono);font-size:12px;color:var(--safe);
+    letter-spacing:0.14em;text-transform:uppercase;margin-bottom:18px;
+    display:flex;align-items:center;gap:8px;
+  }
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--safe);box-shadow:0 0 8px var(--safe);animation:pulse 2.2s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.35;}}
+  h1{
+    font-family:var(--mono);font-weight:700;
+    font-size:clamp(2.4rem, 5vw, 3.6rem);
+    letter-spacing:-0.01em;margin:0 0 18px;line-height:1.05;
+  }
+  h1 .accent{color:var(--muted-2);}
+  .lede{font-size:1.15rem;color:var(--muted);max-width:640px;margin:0 0 32px;}
+  .lede strong{color:var(--text);font-weight:600;}
+  .cta-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;}
+  .btn{
+    font-family:var(--mono);font-size:14px;font-weight:500;
+    padding:11px 20px;border-radius:6px;text-decoration:none;
+    border:1px solid var(--line);transition:border-color .15s, transform .15s;
+  }
+  .btn:hover{transform:translateY(-1px);}
+  .btn-primary{background:var(--safe);color:#0c1712;border-color:var(--safe);}
+  .btn-primary:hover{background:#4ee29c;}
+  .btn-ghost{color:var(--text);}
+  .btn-ghost:hover{border-color:var(--muted-2);}
+
+  /* ── console section ─────────────────────────────────── */
+  .console-shell{
+    margin-top:44px;border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;background:var(--panel);
+    display:grid;grid-template-columns:1fr 260px;
+  }
+  @media (max-width:760px){ .console-shell{grid-template-columns:1fr;} }
+
+  .console-titlebar{
+    grid-column:1/-1;display:flex;align-items:center;gap:8px;
+    padding:11px 16px;border-bottom:1px solid var(--line);background:var(--panel-2);
+    font-family:var(--mono);font-size:12px;color:var(--muted);
+  }
+  .console-titlebar .tf{width:10px;height:10px;border-radius:50%;background:var(--line);}
+  .console-titlebar .path{margin-left:6px;}
+
+  .console-body{
+    font-family:var(--mono);font-size:12.5px;line-height:1.65;
+    padding:18px 18px 22px;height:420px;overflow-y:auto;color:#c7d0dc;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent;
+  }
+  .console-body .l-hot{color:var(--blocked);}
+  .console-body .l-safe{color:var(--safe);}
+  .console-body .l-gate{color:var(--gate);}
+  .console-body .l-dim{color:var(--muted-2);}
+  .console-body .l-data{color:var(--data);}
+  .console-body .l-head{color:var(--text);font-weight:600;}
+  .console-body .cline{white-space:pre;opacity:0;transform:translateY(3px);animation:rise .28s ease forwards;}
+  @keyframes rise{to{opacity:1;transform:translateY(0);}}
+  .caret{display:inline-block;width:7px;height:14px;background:var(--safe);vertical-align:-2px;animation:blink 1s steps(1) infinite;}
+  @keyframes blink{50%{opacity:0;}}
+
+  .sidepanel{
+    border-left:1px solid var(--line);padding:18px;
+    display:flex;flex-direction:column;gap:18px;background:var(--panel-2);
+  }
+  @media (max-width:760px){ .sidepanel{border-left:none;border-top:1px solid var(--line);} }
+  .panel-label{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted-2);margin-bottom:10px;}
+
+  .breaker-state{
+    font-family:var(--mono);font-size:22px;font-weight:700;letter-spacing:0.03em;
+    padding:10px 0 14px;border-bottom:1px solid var(--line);margin-bottom:2px;
+  }
+  #breakerState.closed{color:var(--safe);}
+  #breakerState.open{color:var(--blocked);}
+
+  .check-row{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px;color:var(--muted);padding:5px 0;}
+  .lamp{width:9px;height:9px;border-radius:50%;background:var(--muted-2);flex:0 0 auto;transition:background .2s, box-shadow .2s;}
+  .lamp.on{background:var(--safe);box-shadow:0 0 6px var(--safe);}
+  .lamp.off{background:var(--blocked);box-shadow:0 0 6px var(--blocked);}
+
+  .skew-block{margin-top:4px;}
+  .skew-value{font-family:var(--mono);font-size:26px;font-weight:700;color:var(--text);}
+  .skew-value .unit{font-size:12px;color:var(--muted);font-weight:400;margin-left:6px;}
+  .skew-bar{height:6px;border-radius:3px;background:var(--line);margin-top:10px;overflow:hidden;}
+  .skew-bar-fill{height:100%;background:linear-gradient(90deg,var(--blocked),var(--gate),var(--safe));width:100%;transition:width .6s ease;}
+  .skew-caption{font-family:var(--mono);font-size:10.5px;color:var(--muted-2);margin-top:6px;}
+
+  .cycle-badge{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:auto;padding-top:12px;border-top:1px solid var(--line);}
+  .cycle-badge b{color:var(--text);}
+
+  /* ── safety layers ───────────────────────────────────── */
+  section{padding:64px 0;}
+  .section-head{margin-bottom:34px;}
+  .section-eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted-2);margin-bottom:10px;}
+  h2{font-family:var(--mono);font-size:1.7rem;margin:0 0 8px;font-weight:600;}
+  .section-sub{color:var(--muted);max-width:620px;}
+
+  .layers{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:10px;overflow:hidden;}
+  .layer{
+    display:grid;grid-template-columns:64px 1fr;gap:20px;
+    padding:22px 24px;border-bottom:1px solid var(--line);background:var(--panel);
+  }
+  .layer:last-child{border-bottom:none;}
+  .layer:nth-child(even){background:var(--panel-2);}
+  .layer-num{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--muted-2);}
+  .layer h3{margin:0 0 6px;font-family:var(--mono);font-size:15px;color:var(--text);}
+  .layer p{margin:0;color:var(--muted);font-size:14.5px;max-width:640px;}
+  .layer code{font-family:var(--mono);font-size:13px;background:var(--bg);padding:1px 6px;border-radius:4px;color:var(--data);}
+
+  /* ── architecture ────────────────────────────────────── */
+  .arch{
+    border:1px solid var(--line);border-radius:10px;background:var(--panel);
+    padding:30px 24px;font-family:var(--mono);font-size:13px;color:var(--muted);
+  }
+  .arch-row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px;}
+  .arch-box{
+    border:1px solid var(--line);border-radius:8px;padding:12px 16px;background:var(--panel-2);
+    color:var(--text);flex:1 1 150px;min-width:150px;text-align:center;
+  }
+  .arch-box.gate{border-color:var(--gate);color:var(--gate);}
+  .arch-arrow{color:var(--muted-2);font-size:18px;flex:0 0 auto;}
+  .arch-note{font-size:12px;color:var(--muted-2);margin-top:18px;line-height:1.7;}
+
+  /* ── verified strip ──────────────────────────────────── */
+  .verify{
+    display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+    background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden;
+  }
+  @media (max-width:700px){ .verify{grid-template-columns:repeat(2,1fr);} }
+  .verify-cell{background:var(--panel);padding:22px 20px;}
+  .verify-num{font-family:var(--mono);font-size:1.7rem;font-weight:700;color:var(--safe);}
+  .verify-label{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:6px;letter-spacing:.03em;}
+
+  /* ── scope / footer ──────────────────────────────────── */
+  .scope-note{border-left:2px solid var(--line);padding-left:18px;color:var(--muted);font-size:14.5px;max-width:680px;}
+  footer{border-top:1px solid var(--line);padding:34px 0 60px;}
+  footer .wrap{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;}
+  footer .fmono{font-family:var(--mono);font-size:12.5px;color:var(--muted-2);}
+  footer a{color:var(--muted);text-decoration:none;}
+  footer a:hover{color:var(--text);}
+
+  @media (prefers-reduced-motion: reduce){
+    .dot, .caret{animation:none;}
+    .cline{animation:none;opacity:1;transform:none;}
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">SWAY</span>
+  <nav>
+    <a href="#demo">Demo</a>
+    <a href="#safety">Safety model</a>
+    <a href="#architecture">Architecture</a>
+    <a href="https://github.com/joshuabvarghese/sway">GitHub ↗</a>
+  </nav>
+</div>
+
+<div class="wrap">
+  <section class="hero">
+    <div class="eyebrow"><span class="dot"></span> CIRCUIT CLOSED — AUTOMATION ENABLED</div>
+    <h1>The rebalancer that<br>knows when <span class="accent">not</span> to act.</h1>
+    <p class="lede">
+      Sway watches an OpenSearch cluster for hot spots and moves the minimum number of shards
+      needed to relieve them — but only after a circuit breaker checks cluster health, search
+      latency, and in-flight relocations. <strong>Every run below is real, deterministic output</strong>
+      from the actual simulator, not a mockup.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#demo">Watch it run ↓</a>
+      <a class="btn btn-ghost" href="https://github.com/joshuabvarghese/sway">View source</a>
+    </div>
+  </section>
+
+  <section id="demo" style="padding-top:0;">
+    <div class="console-shell">
+      <div class="console-titlebar">
+        <span class="tf"></span><span class="tf"></span><span class="tf"></span>
+        <span class="path">rebalancer --simulate --cycles 3</span>
+      </div>
+      <div class="console-body" id="consoleBody" aria-live="polite"></div>
+      <div class="sidepanel">
+        <div>
+          <div class="panel-label">Circuit breaker</div>
+          <div class="breaker-state closed" id="breakerState">CLOSED</div>
+          <div class="check-row"><span class="lamp on" id="lampHealth"></span> Cluster health</div>
+          <div class="check-row"><span class="lamp on" id="lampLatency"></span> Search latency</div>
+          <div class="check-row"><span class="lamp on" id="lampReloc"></span> Relocating shards</div>
+        </div>
+        <div class="skew-block">
+          <div class="panel-label">Skew score</div>
+          <div class="skew-value"><span id="skewValue">0.1509</span><span class="unit">std-dev</span></div>
+          <div class="skew-bar"><div class="skew-bar-fill" id="skewBar" style="width:100%"></div></div>
+          <div class="skew-caption">lower is more balanced</div>
+        </div>
+        <div class="cycle-badge">Cycle <b id="cycleNum">1</b> of 3</div>
+      </div>
+    </div>
+    <p class="section-sub" style="margin-top:16px;">
+      This replays a captured transcript of <code style="font-family:var(--mono);color:var(--data);">./rebalancer --simulate --cycles 3</code> —
+      the simulator is deterministic, so running it yourself produces these exact numbers.
+      <a href="#" id="replayBtn">Replay ↻</a>
+    </p>
+  </section>
+
+  <section id="safety">
+    <div class="section-head">
+      <div class="section-eyebrow">Safety model</div>
+      <h2>Four layers, in order of how they're checked</h2>
+      <p class="section-sub">Each layer exists because the one before it isn't sufficient on its own. If any layer blocks, everything downstream is skipped for that cycle.</p>
+    </div>
+    <div class="layers">
+      <div class="layer">
+        <div class="layer-num">01</div>
+        <div><h3>Default immutability</h3><p><code>dry_run</code> is <code>true</code> in every factory config. The engine plans and logs every move it would make without touching the cluster until you explicitly opt in.</p></div>
+      </div>
+      <div class="layer">
+        <div class="layer-num">02</div>
+        <div><h3>Circuit breaker</h3><p>Health, latency, and relocating-shard checks run fresh before every cycle. One failure opens the circuit and aborts the cycle — no partial moves, no half-open state.</p></div>
+      </div>
+      <div class="layer">
+        <div class="layer-num">03</div>
+        <div><h3>Conservative move sizing</h3><p><code>max_moves_per_cycle</code> (default 5) and <code>skew_reduction_target</code> (default 25%) mean the engine never tries to fully rebalance in one pass.</p></div>
+      </div>
+      <div class="layer">
+        <div class="layer-num">04</div>
+        <div><h3>Placement guards</h3><p>A primary and its replica are never planned onto the same destination node, and a move is skipped if it would push the destination's disk past 90%.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <div class="section-head">
+      <div class="section-eyebrow">Architecture</div>
+      <h2>One abstraction boundary</h2>
+      <p class="section-sub"><code style="font-family:var(--mono);color:var(--data);">opensearch.Client</code> is the only interface the rest of the system depends on — real HTTP client and deterministic simulator both implement it.</p>
+    </div>
+    <div class="arch">
+      <div class="arch-row">
+        <div class="arch-box">Monitoring Agent</div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box gate">Circuit Breaker</div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box">Target State Generator</div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box">Executor</div>
+      </div>
+      <div class="arch-note">
+        Snapshot in → three safety checks → minimal shard-move plan → dry-run log or live <code style="color:var(--data);">_cluster/reroute</code> call.<br>
+        Swap the client for a different backend and nothing left of the breaker changes.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <div class="section-eyebrow">Verified</div>
+      <h2>What's actually true right now</h2>
+    </div>
+    <div class="verify">
+      <div class="verify-cell"><div class="verify-num">20/20</div><div class="verify-label">TESTS PASSING</div></div>
+      <div class="verify-cell"><div class="verify-num">0</div><div class="verify-label">GO VET WARNINGS</div></div>
+      <div class="verify-cell"><div class="verify-num">0</div><div class="verify-label">GOFMT DIFFS</div></div>
+      <div class="verify-cell"><div class="verify-num">4</div><div class="verify-label">SAFETY LAYERS</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <div class="section-eyebrow">Scope</div>
+      <h2>What this is (and isn't)</h2>
+    </div>
+    <p class="scope-note">
+      Sway does one job: decide which shards to move, and refuse to move them under the wrong
+      conditions. It's not a chaos-engineering harness, a general agent framework, or a
+      debugging proxy — those are different problems, and they live in different projects.
+    </p>
+  </section>
+</div>
+
+<footer>
+  <div class="wrap">
+    <span class="fmono">MIT licensed · Go 1.21+</span>
+    <a href="https://github.com/joshuabvarghese/sway" class="fmono">github.com/joshuabvarghese/sway ↗</a>
+  </div>
+</footer>
+
+<script>
+(function(){
+  const consoleBody = document.getElementById('consoleBody');
+  const breakerState = document.getElementById('breakerState');
+  const lampHealth = document.getElementById('lampHealth');
+  const lampLatency = document.getElementById('lampLatency');
+  const lampReloc = document.getElementById('lampReloc');
+  const skewValue = document.getElementById('skewValue');
+  const skewBar = document.getElementById('skewBar');
+  const cycleNum = document.getElementById('cycleNum');
+  const replayBtn = document.getElementById('replayBtn');
+
+  // Real, captured output from `./rebalancer --simulate --cycles 3`.
+  // Skew values map to a 0-100% bar width against the initial 0.1509 baseline.
+  const MAX_SKEW = 0.1509;
+
+  function pct(skew){ return Math.max(4, Math.min(100, (skew / MAX_SKEW) * 100)); }
+
+  const timeline = [
+    { cls:'l-head', text:'SIMULATED CLUSTER INITIAL STATE — 10 nodes, 31 shards', delay:60 },
+    { cls:'l-hot',  text:'  node-0   85.0% JVM  20.8% disk  6 shards   [HOT]', delay:40 },
+    { cls:'l-hot',  text:'  node-1   79.0% JVM  15.1% disk  6 shards   [HOT]', delay:40 },
+    { cls:'l-dim',  text:'  node-2..9  29–71% JVM   2–5 shards each', delay:40 },
+    { cls:'', text:'', delay:120 },
+
+    { cls:'l-head', cycle:1, text:'CYCLE 1 of 3', delay:60 },
+    { cls:'', text:'[MONITORING AGENT] Skew Score: 0.1509', delay:50, skew:0.1509 },
+    { cls:'l-safe', text:'[CIRCUIT BREAKER] health=GREEN  latency=0.0ms  relocating=0 → CLOSED', delay:60, breaker:'closed' },
+    { cls:'', text:'[REBALANCER] Current 0.1509 → Projected 0.1038  (31.2% reduction, target 25% ✓)', delay:60, skew:0.1038 },
+    { cls:'l-data', text:'  1  logs-2024[0]/primary    22.00 GiB  node-0 → node-9', delay:35 },
+    { cls:'l-data', text:'  2  traces-2024[0]/primary  19.00 GiB  node-0 → node-8', delay:35 },
+    { cls:'l-data', text:'  3  logs-2024[1]/primary    16.00 GiB  node-0 → node-7', delay:35 },
+    { cls:'l-data', text:'  4  logs-2024[2]/primary    14.00 GiB  node-1 → node-6', delay:35 },
+    { cls:'l-safe', text:'[EXECUTOR] 4 shard move(s) executed ✓', delay:80 },
+    { cls:'', text:'', delay:100 },
+
+    { cls:'l-head', cycle:2, text:'CYCLE 2 of 3', delay:60 },
+    { cls:'', text:'[MONITORING AGENT] Skew Score: 0.1024', delay:50, skew:0.1024 },
+    { cls:'l-safe', text:'[CIRCUIT BREAKER] health=GREEN  latency=0.0ms  relocating=0 → CLOSED', delay:60, breaker:'closed' },
+    { cls:'', text:'[REBALANCER] Current 0.1024 → Projected 0.0643  (37.2% reduction, target 25% ✓)', delay:60, skew:0.0643 },
+    { cls:'l-data', text:'  1  traces-2024[1]/primary   12.00 GiB  node-1 → node-9', delay:35 },
+    { cls:'l-data', text:'  2  metrics-2024[1]/primary   9.00 GiB  node-1 → node-5', delay:35 },
+    { cls:'l-data', text:'  3  traces-2024[2]/primary    9.00 GiB  node-2 → node-8', delay:35 },
+    { cls:'l-safe', text:'[EXECUTOR] 3 shard move(s) executed ✓', delay:80 },
+    { cls:'', text:'', delay:100 },
+
+    { cls:'l-head', cycle:3, text:'CYCLE 3 of 3', delay:60 },
+    { cls:'', text:'[MONITORING AGENT] Skew Score: 0.0666', delay:50, skew:0.0666 },
+    { cls:'l-safe', text:'[CIRCUIT BREAKER] health=GREEN  latency=0.0ms  relocating=0 → CLOSED', delay:60, breaker:'closed' },
+    { cls:'', text:'[REBALANCER] Current 0.0666 → Projected 0.0483  (27.4% reduction, target 25% ✓)', delay:60, skew:0.0483 },
+    { cls:'l-data', text:'  1  metrics-2024[2]/primary   6.00 GiB  node-2 → node-4', delay:35 },
+    { cls:'l-data', text:'  2  traces-2024[3]/primary    5.00 GiB  node-2 → node-3', delay:35 },
+    { cls:'l-safe', text:'[EXECUTOR] 2 shard move(s) executed ✓', delay:80 },
+    { cls:'', text:'', delay:80 },
+    { cls:'l-head', text:'SIMULATION COMPLETE — skew 0.1509 → 0.0483 across 9 moves.', delay:0 },
+  ];
+
+  let timer = null;
+
+  function setBreaker(state){
+    if(state === 'open'){
+      breakerState.textContent = 'OPEN';
+      breakerState.className = 'breaker-state open';
+      [lampHealth, lampLatency, lampReloc].forEach(l => { l.className = 'lamp off'; });
+    } else {
+      breakerState.textContent = 'CLOSED';
+      breakerState.className = 'breaker-state closed';
+      [lampHealth, lampLatency, lampReloc].forEach(l => { l.className = 'lamp on'; });
+    }
+  }
+
+  function run(){
+    consoleBody.innerHTML = '';
+    setBreaker('closed');
+    skewValue.textContent = '0.1509';
+    skewBar.style.width = '100%';
+    cycleNum.textContent = '1';
+    let i = 0;
+
+    function step(){
+      if(i >= timeline.length){
+        const caret = document.createElement('span');
+        caret.className = 'caret';
+        consoleBody.appendChild(caret);
+        return;
+      }
+      const item = timeline[i++];
+      const line = document.createElement('div');
+      line.className = 'cline ' + (item.cls || '');
+      line.textContent = item.text;
+      consoleBody.appendChild(line);
+      consoleBody.scrollTop = consoleBody.scrollHeight;
+
+      if(item.cycle) cycleNum.textContent = String(item.cycle);
+      if(item.breaker) setBreaker(item.breaker);
+      if(typeof item.skew === 'number'){
+        skewValue.textContent = item.skew.toFixed(4);
+        skewBar.style.width = pct(item.skew) + '%';
+      }
+      timer = setTimeout(step, item.delay);
+    }
+    step();
+  }
+
+  replayBtn.addEventListener('click', function(e){
+    e.preventDefault();
+    if(timer) clearTimeout(timer);
+    run();
+  });
+
+  // Kick off when the console scrolls into view.
+  const obs = new IntersectionObserver(function(entries){
+    if(entries[0].isIntersecting){
+      run();
+      obs.disconnect();
+    }
+  }, { threshold: 0.3 });
+  obs.observe(document.getElementById('consoleBody'));
+})();
+</script>
+
+</body>
+</html>
